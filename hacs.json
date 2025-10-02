@@ -1,5 +1,5 @@
 {
-  "name": "Daikin AC (Firmware 2.8.0 Support)",
+  "name": "Daikin AC - Firmware 2.8.0 Support",
   "content_in_root": false,
   "render_readme": true,
   "domains": ["daikin"],
