@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 
 from aiohttp import ClientConnectionError
 from pydaikin.daikin_base import Appliance
@@ -21,12 +22,25 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
-from homeassistant.util.ssl import client_context_no_verify
 
 from .const import KEY_MAC, TIMEOUT
 from .coordinator import DaikinConfigEntry, DaikinCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def get_daikin_ssl_context() -> ssl.SSLContext:
+    """Create SSL context with legacy Daikin support."""
+    ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    # Lower security level to allow legacy Daikin SSL/TLS configurations
+    # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
+    try:
+        ssl_context.set_ciphers('DEFAULT:@SECLEVEL=0')
+    except ssl.SSLError:
+        pass  # Fallback for systems that don't support SECLEVEL
+    return ssl_context
 
 
 PLATFORMS = [Platform.CLIMATE, Platform.SENSOR, Platform.SWITCH]
@@ -49,7 +63,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: DaikinConfigEntry) -> bo
                 key=entry.data.get(CONF_API_KEY),
                 uuid=entry.data.get(CONF_UUID),
                 password=entry.data.get(CONF_PASSWORD),
-                ssl_context=client_context_no_verify(),
+                ssl_context=get_daikin_ssl_context(),
             )
         _LOGGER.debug("Connection to %s successful", host)
     except TimeoutError as err:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from typing import Any
 from uuid import uuid4
 
@@ -18,11 +19,24 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PASSWORD, CONF_UUID
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
-from homeassistant.util.ssl import client_context_no_verify
 
 from .const import DOMAIN, KEY_MAC, TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def get_daikin_ssl_context() -> ssl.SSLContext:
+    """Create SSL context with legacy Daikin support."""
+    ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    # Lower security level to allow legacy Daikin SSL/TLS configurations
+    # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
+    try:
+        ssl_context.set_ciphers('DEFAULT:@SECLEVEL=0')
+    except ssl.SSLError:
+        pass  # Fallback for systems that don't support SECLEVEL
+    return ssl_context
 
 
 class FlowHandler(ConfigFlow, domain=DOMAIN):
@@ -91,7 +105,7 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                     key=key,
                     uuid=uuid,
                     password=password,
-                    ssl_context=client_context_no_verify(),
+                    ssl_context=get_daikin_ssl_context(),
                 )
         except (TimeoutError, ClientError):
             self.host = None
@@ -184,7 +198,7 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                     key=key,
                     uuid=uuid,
                     password=password,
-                    ssl_context=client_context_no_verify(),
+                    ssl_context=get_daikin_ssl_context(),
                 )
         except (TimeoutError, ClientError):
             return self.async_show_form(
