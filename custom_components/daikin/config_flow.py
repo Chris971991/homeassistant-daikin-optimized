@@ -143,6 +143,75 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
             user_input.get(CONF_PASSWORD),
         )
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the integration."""
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+
+        if user_input is None:
+            # Show form with current values
+            self.host = entry.data.get(CONF_HOST)
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(CONF_HOST, default=entry.data.get(CONF_HOST)): str,
+                        vol.Optional(CONF_API_KEY, default=entry.data.get(CONF_API_KEY, "")): str,
+                        vol.Optional(CONF_PASSWORD, default=entry.data.get(CONF_PASSWORD, "")): str,
+                    }
+                ),
+            )
+
+        # Validate the new configuration
+        if user_input.get(CONF_API_KEY) and user_input.get(CONF_PASSWORD):
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=self.schema,
+                errors={"base": "api_password"},
+            )
+
+        # Test connection with new credentials
+        key = user_input.get(CONF_API_KEY) or None
+        password = user_input.get(CONF_PASSWORD) or None
+        uuid = str(uuid4()) if key else None
+
+        try:
+            async with asyncio.timeout(TIMEOUT):
+                device: Appliance = await DaikinFactory(
+                    user_input[CONF_HOST],
+                    async_get_clientsession(self.hass),
+                    key=key,
+                    uuid=uuid,
+                    password=password,
+                    ssl_context=client_context_no_verify(),
+                )
+        except (TimeoutError, ClientError):
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=self.schema,
+                errors={"base": "cannot_connect"},
+            )
+        except Exception as err:
+            _LOGGER.exception("Unexpected error during reconfigure: %s", err)
+            return self.async_show_form(
+                step_id="reconfigure",
+                data_schema=self.schema,
+                errors={"base": "unknown"},
+            )
+
+        # Update the config entry
+        return self.async_update_reload_and_abort(
+            entry,
+            data={
+                CONF_HOST: user_input[CONF_HOST],
+                KEY_MAC: device.mac,
+                CONF_API_KEY: key,
+                CONF_UUID: uuid,
+                CONF_PASSWORD: password,
+            },
+        )
+
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
     ) -> ConfigFlowResult:
