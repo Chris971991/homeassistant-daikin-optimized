@@ -1,13 +1,15 @@
 """Coordinator for Daikin integration."""
 
+import asyncio
 from datetime import timedelta
 import logging
 
 from pydaikin.daikin_base import Appliance
+from pydaikin.exceptions import DaikinException
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN
 
@@ -33,4 +35,10 @@ class DaikinCoordinator(DataUpdateCoordinator[None]):
         self.device = device
 
     async def _async_update_data(self) -> None:
-        await self.device.update_status()
+        """Fetch data from Daikin device."""
+        try:
+            await self.device.update_status()
+        except asyncio.TimeoutError as err:
+            raise UpdateFailed(f"Timeout communicating with {self.device.values.get('name', 'device')}") from err
+        except DaikinException as err:
+            raise UpdateFailed(f"Error communicating with {self.device.values.get('name', 'device')}: {err}") from err
