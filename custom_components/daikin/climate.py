@@ -179,7 +179,13 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             try:
                 await self.device.set(values)
             except Exception as e:
-                _LOGGER.error("Error setting device values: %s", e, exc_info=True)
+                # Check if this is a network timeout or cancellation
+                error_msg = str(e)
+                if "timeout" in error_msg.lower() or "cancel" in error_msg.lower():
+                    _LOGGER.warning("Network timeout communicating with device: %s", error_msg)
+                else:
+                    _LOGGER.error("Error setting device values: %s", e, exc_info=True)
+
                 # Clear optimistic state on failure
                 self._optimistic_target_temp = None
                 self._optimistic_hvac_mode = None
