@@ -55,6 +55,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: DaikinConfigEntry) -> bo
 
     session = async_get_clientsession(hass)
     host = conf[CONF_HOST]
+    # Create SSL context in executor to avoid blocking the event loop
+    ssl_context = await hass.async_add_executor_job(get_daikin_ssl_context)
     try:
         async with asyncio.timeout(TIMEOUT):
             device: Appliance = await DaikinFactory(
@@ -63,7 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: DaikinConfigEntry) -> bo
                 key=entry.data.get(CONF_API_KEY),
                 uuid=entry.data.get(CONF_UUID),
                 password=entry.data.get(CONF_PASSWORD),
-                ssl_context=get_daikin_ssl_context(),
+                ssl_context=ssl_context,
             )
         _LOGGER.debug("Connection to %s successful", host)
     except TimeoutError as err:
