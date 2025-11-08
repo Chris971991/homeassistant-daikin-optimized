@@ -178,6 +178,10 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
             try:
                 await self.device.set(values)
+
+                # Immediately request a refresh to get the latest state
+                # This reduces perceived lag from 60s → ~1-2s
+                await self.coordinator.async_request_refresh()
             except Exception as e:
                 # Check if this is a network timeout or cancellation
                 error_msg = str(e)
@@ -307,6 +311,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             await self.device.set_advanced_mode(
                 HA_PRESET_TO_DAIKIN[PRESET_ECO], ATTR_STATE_OFF
             )
+
+        # Immediately request a refresh to get the latest state
+        await self.coordinator.async_request_refresh()
     @property
     def preset_modes(self) -> list[str]:
         """List of available preset modes."""
