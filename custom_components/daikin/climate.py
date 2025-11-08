@@ -149,7 +149,8 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 if attr == ATTR_HVAC_MODE:
                     values[daikin_attr] = HA_STATE_TO_DAIKIN[value]
                 elif value in self._list[attr]:
-                    values[daikin_attr] = value.lower()
+                    # Don't use .lower() - pydaikin's human_to_daikin() expects title case
+                    values[daikin_attr] = value
                 else:
                     _LOGGER.error("Invalid value %s for %s", attr, value)
 
