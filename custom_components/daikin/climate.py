@@ -183,6 +183,15 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # Immediately request a refresh to get the latest state
                 # This reduces perceived lag from 60s → ~1-2s
                 await self.coordinator.async_request_refresh()
+
+                # Clear optimistic state immediately after refresh
+                # This ensures state_attr() returns actual device state for automations
+                # UI still gets instant feedback since refresh updates device state quickly
+                self._optimistic_target_temp = None
+                self._optimistic_hvac_mode = None
+                self._optimistic_fan_mode = None
+                self._optimistic_swing_mode = None
+                self.async_write_ha_state()
             except Exception as e:
                 # Check if this is a network timeout or cancellation
                 error_msg = str(e)
@@ -337,40 +346,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        # Only clear optimistic state if device confirms the change
-        # This prevents flickering when the device hasn't processed the command yet
-
-        if self._optimistic_target_temp is not None:
-            if abs(self.device.target_temperature - self._optimistic_target_temp) < 0.1:
-                self._optimistic_target_temp = None
-
-        if self._optimistic_hvac_mode is not None:
-            device_mode = DAIKIN_TO_HA_STATE.get(
-                self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
-            )
-            if device_mode == self._optimistic_hvac_mode:
-                self._optimistic_hvac_mode = None
-
-        if self._optimistic_fan_mode is not None:
-            device_fan = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE])[1].title()
-            _LOGGER.debug(
-                "Fan mode comparison: optimistic=%s, device=%s, match=%s",
-                self._optimistic_fan_mode,
-                device_fan,
-                device_fan == self._optimistic_fan_mode
-            )
-            if device_fan == self._optimistic_fan_mode:
-                self._optimistic_fan_mode = None
-            # Also clear if automation changed it to something else
-            elif device_fan != self._optimistic_fan_mode:
-                # Device has different value (automation may have changed it)
-                # Clear optimistic to show actual device state
-                _LOGGER.debug("Clearing optimistic fan mode due to device mismatch")
-                self._optimistic_fan_mode = None
-
-        if self._optimistic_swing_mode is not None:
-            device_swing = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_SWING_MODE])[1].title()
-            if device_swing == self._optimistic_swing_mode:
-                self._optimistic_swing_mode = None
-
+        # Optimistic state is now cleared immediately after commands
+        # No need to check for device confirmation here
         super()._handle_coordinator_update()
