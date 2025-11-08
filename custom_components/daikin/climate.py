@@ -352,7 +352,19 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
         if self._optimistic_fan_mode is not None:
             device_fan = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE])[1].title()
+            _LOGGER.debug(
+                "Fan mode comparison: optimistic=%s, device=%s, match=%s",
+                self._optimistic_fan_mode,
+                device_fan,
+                device_fan == self._optimistic_fan_mode
+            )
             if device_fan == self._optimistic_fan_mode:
+                self._optimistic_fan_mode = None
+            # Also clear if automation changed it to something else
+            elif device_fan != self._optimistic_fan_mode:
+                # Device has different value (automation may have changed it)
+                # Clear optimistic to show actual device state
+                _LOGGER.debug("Clearing optimistic fan mode due to device mismatch")
                 self._optimistic_fan_mode = None
 
         if self._optimistic_swing_mode is not None:
