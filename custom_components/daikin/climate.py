@@ -336,9 +336,28 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        # Clear optimistic state when real data arrives
-        self._optimistic_target_temp = None
-        self._optimistic_hvac_mode = None
-        self._optimistic_fan_mode = None
-        self._optimistic_swing_mode = None
+        # Only clear optimistic state if device confirms the change
+        # This prevents flickering when the device hasn't processed the command yet
+
+        if self._optimistic_target_temp is not None:
+            if abs(self.device.target_temperature - self._optimistic_target_temp) < 0.1:
+                self._optimistic_target_temp = None
+
+        if self._optimistic_hvac_mode is not None:
+            device_mode = DAIKIN_TO_HA_STATE.get(
+                self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
+            )
+            if device_mode == self._optimistic_hvac_mode:
+                self._optimistic_hvac_mode = None
+
+        if self._optimistic_fan_mode is not None:
+            device_fan = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE])[1].title()
+            if device_fan == self._optimistic_fan_mode:
+                self._optimistic_fan_mode = None
+
+        if self._optimistic_swing_mode is not None:
+            device_swing = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_SWING_MODE])[1].title()
+            if device_swing == self._optimistic_swing_mode:
+                self._optimistic_swing_mode = None
+
         super()._handle_coordinator_update()
