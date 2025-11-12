@@ -248,6 +248,13 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         # Return optimistic value if set, otherwise actual device value
         if self._optimistic_hvac_mode is not None:
             return self._optimistic_hvac_mode
+
+        # Double-check power state to prevent showing wrong mode when device is off
+        # This handles cases where mode value doesn't match power state
+        power_state = self.device.values.get('pow', '1')
+        if power_state == '0':
+            return HVACMode.OFF
+
         daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
         return DAIKIN_TO_HA_STATE.get(daikin_mode, HVACMode.HEAT_COOL)
 
