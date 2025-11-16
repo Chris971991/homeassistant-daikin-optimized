@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -184,9 +185,11 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # This reduces perceived lag from 60s → ~1-2s
                 await self.coordinator.async_request_refresh()
 
-                # Clear optimistic state immediately after refresh
-                # This ensures state_attr() returns actual device state for automations
-                # UI still gets instant feedback since refresh updates device state quickly
+                # Clear optimistic state after a brief delay to avoid database race conditions
+                # The delay allows the coordinator refresh to complete and write actual device state
+                # before we trigger another state write by clearing optimistic values
+                await asyncio.sleep(0.5)
+
                 self._optimistic_target_temp = None
                 self._optimistic_hvac_mode = None
                 self._optimistic_fan_mode = None
