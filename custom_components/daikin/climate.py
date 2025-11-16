@@ -343,7 +343,17 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_turn_on(self) -> None:
         """Turn device on."""
-        await self.device.set({})
+        # Get the current mode from device to restore previous state
+        current_daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
+
+        # If current mode is 'off', use auto mode as sensible default
+        if current_daikin_mode == 'off':
+            target_mode = HVACMode.HEAT_COOL  # Auto mode
+        else:
+            # Restore the mode that was set before it was turned off
+            target_mode = DAIKIN_TO_HA_STATE.get(current_daikin_mode, HVACMode.HEAT_COOL)
+
+        await self._set({ATTR_HVAC_MODE: target_mode})
 
     async def async_turn_off(self) -> None:
         """Turn device off."""
