@@ -248,15 +248,15 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
     @property
     def hvac_mode(self) -> HVACMode:
         """Return current operation ie. heat, cool, idle."""
-        # Return optimistic value if set, otherwise actual device value
-        if self._optimistic_hvac_mode is not None:
-            return self._optimistic_hvac_mode
-
-        # Double-check power state to prevent showing wrong mode when device is off
-        # This handles cases where mode value doesn't match power state
+        # Always check actual power state first to handle manual off via remote/app
+        # This prevents showing optimistic "on" state when device is actually off
         power_state = self.device.values.get('pow', '1')
         if power_state == '0':
             return HVACMode.OFF
+
+        # Return optimistic value if set, otherwise actual device value
+        if self._optimistic_hvac_mode is not None:
+            return self._optimistic_hvac_mode
 
         daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
         return DAIKIN_TO_HA_STATE.get(daikin_mode, HVACMode.HEAT_COOL)
