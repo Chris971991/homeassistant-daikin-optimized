@@ -27,5 +27,6 @@ KEY_IP = "ip"
 TIMEOUT = 60
 
 # Default polling interval for state updates (seconds)
+# Reduced to 10s for better responsiveness to manual remote changes
 # Can be overridden via options flow in the future
-DEFAULT_UPDATE_INTERVAL = 15
+DEFAULT_UPDATE_INTERVAL = 10

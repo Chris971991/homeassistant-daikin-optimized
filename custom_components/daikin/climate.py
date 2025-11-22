@@ -179,16 +179,12 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             self.async_write_ha_state()
 
             try:
+                # pydaikin automatically calls update_status() after set(), so we don't need
+                # to request a coordinator refresh here - it would be redundant
                 await self.device.set(values)
 
-                # Immediately request a refresh to get the latest state
-                # This reduces perceived lag from 60s → ~1-2s
-                await self.coordinator.async_request_refresh()
-
-                # Clear optimistic state after a brief delay to avoid database race conditions
-                # The delay allows the coordinator refresh to complete and write actual device state
-                # before we trigger another state write by clearing optimistic values
-                await asyncio.sleep(0.5)
+                # Wait briefly for the device state to update, then clear optimistic values
+                await asyncio.sleep(0.1)
 
                 self._optimistic_target_temp = None
                 self._optimistic_hvac_mode = None
@@ -332,9 +328,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 await self.device.set_advanced_mode(
                     HA_PRESET_TO_DAIKIN[PRESET_ECO], ATTR_STATE_OFF
                 )
-
-            # Immediately request a refresh to get the latest state
-            await self.coordinator.async_request_refresh()
         except Exception as e:
             _LOGGER.error("Error setting preset mode %s: %s", preset_mode, e, exc_info=True)
             raise
@@ -368,8 +361,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             await self.device.set(
                 {HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE]: HA_STATE_TO_DAIKIN[HVACMode.OFF]}
             )
-            # Request coordinator refresh to sync state immediately
-            await self.coordinator.async_request_refresh()
         except Exception as e:
             _LOGGER.error("Error turning off device: %s", e, exc_info=True)
             raise
