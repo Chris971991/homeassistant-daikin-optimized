@@ -183,14 +183,8 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # to request a coordinator refresh here - it would be redundant
                 await self.device.set(values)
 
-                # Wait briefly for the device state to update, then clear optimistic values
-                await asyncio.sleep(0.1)
-
-                self._optimistic_target_temp = None
-                self._optimistic_hvac_mode = None
-                self._optimistic_fan_mode = None
-                self._optimistic_swing_mode = None
-                self.async_write_ha_state()
+                # Don't clear optimistic state here - let _handle_coordinator_update() do it
+                # when real device state arrives. This keeps UI responsive without flickering.
             except Exception as e:
                 # Check if this is a network timeout or cancellation
                 error_msg = str(e)
@@ -367,6 +361,26 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        # Optimistic state is now cleared immediately after commands
-        # No need to check for device confirmation here
+        # Clear optimistic values if they match the real device state
+        # This provides smooth UI updates without flickering
+        if self._optimistic_target_temp is not None:
+            if abs(self.device.target_temperature - self._optimistic_target_temp) < 0.1:
+                self._optimistic_target_temp = None
+
+        if self._optimistic_hvac_mode is not None:
+            daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
+            actual_mode = DAIKIN_TO_HA_STATE.get(daikin_mode, HVACMode.HEAT_COOL)
+            if actual_mode == self._optimistic_hvac_mode:
+                self._optimistic_hvac_mode = None
+
+        if self._optimistic_fan_mode is not None:
+            actual_fan = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE])[1].title()
+            if actual_fan == self._optimistic_fan_mode:
+                self._optimistic_fan_mode = None
+
+        if self._optimistic_swing_mode is not None:
+            actual_swing = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_SWING_MODE])[1].title()
+            if actual_swing == self._optimistic_swing_mode:
+                self._optimistic_swing_mode = None
+
         super()._handle_coordinator_update()
