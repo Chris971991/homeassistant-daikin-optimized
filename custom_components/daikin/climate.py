@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -122,6 +123,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         self._optimistic_hvac_mode = None
         self._optimistic_fan_mode = None
         self._optimistic_swing_mode = None
+        self._optimistic_set_time = None  # Timestamp to detect stale optimistic values
 
         self._attr_supported_features = (
             ClimateEntityFeature.TURN_ON
@@ -175,6 +177,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             if ATTR_SWING_MODE in settings:
                 self._optimistic_swing_mode = settings[ATTR_SWING_MODE]
 
+            # Record timestamp for staleness detection
+            self._optimistic_set_time = time.time()
+
             # Trigger immediate UI update
             self.async_write_ha_state()
 
@@ -198,6 +203,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 self._optimistic_hvac_mode = None
                 self._optimistic_fan_mode = None
                 self._optimistic_swing_mode = None
+                self._optimistic_set_time = None
                 self.async_write_ha_state()
                 raise
 
@@ -361,26 +367,48 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        # Clear optimistic values if they match the real device state
-        # This provides smooth UI updates without flickering
+        # Check if optimistic values are stale (>30 seconds old)
+        # This prevents stuck optimistic state from manual changes or failed commands
+        optimistic_timeout = 30  # seconds
+        is_stale = False
+
+        if self._optimistic_set_time is not None:
+            age = time.time() - self._optimistic_set_time
+            is_stale = age > optimistic_timeout
+            if is_stale:
+                _LOGGER.debug(
+                    "Optimistic state is stale (%.1fs old), clearing unconditionally",
+                    age
+                )
+
+        # Clear optimistic values if they match device state OR are stale
         if self._optimistic_target_temp is not None:
-            if abs(self.device.target_temperature - self._optimistic_target_temp) < 0.1:
+            if is_stale or abs(self.device.target_temperature - self._optimistic_target_temp) < 0.1:
                 self._optimistic_target_temp = None
 
         if self._optimistic_hvac_mode is not None:
             daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
             actual_mode = DAIKIN_TO_HA_STATE.get(daikin_mode, HVACMode.HEAT_COOL)
-            if actual_mode == self._optimistic_hvac_mode:
+            if is_stale or actual_mode == self._optimistic_hvac_mode:
                 self._optimistic_hvac_mode = None
 
         if self._optimistic_fan_mode is not None:
             actual_fan = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE])[1].title()
-            if actual_fan == self._optimistic_fan_mode:
+            if is_stale or actual_fan == self._optimistic_fan_mode:
                 self._optimistic_fan_mode = None
 
         if self._optimistic_swing_mode is not None:
             actual_swing = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_SWING_MODE])[1].title()
-            if actual_swing == self._optimistic_swing_mode:
+            if is_stale or actual_swing == self._optimistic_swing_mode:
                 self._optimistic_swing_mode = None
+
+        # Clear timestamp if all optimistic values are gone
+        if (
+            self._optimistic_target_temp is None
+            and self._optimistic_hvac_mode is None
+            and self._optimistic_fan_mode is None
+            and self._optimistic_swing_mode is None
+        ):
+            self._optimistic_set_time = None
 
         super()._handle_coordinator_update()
