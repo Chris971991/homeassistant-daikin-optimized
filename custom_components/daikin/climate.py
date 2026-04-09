@@ -388,6 +388,8 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
+        # v2.37.1: Set command time BEFORE _set() to survive mode:restart cancellation
+        self._last_any_command_time = time.time()
         await self._set(kwargs)
 
     @property
@@ -452,6 +454,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
+        self._last_any_command_time = time.time()
         await self._set({ATTR_HVAC_MODE: hvac_mode})
 
     @property
@@ -464,6 +467,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set fan mode."""
+        self._last_any_command_time = time.time()
         await self._set({ATTR_FAN_MODE: fan_mode})
 
     @property
@@ -476,6 +480,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Set new target temperature."""
+        self._last_any_command_time = time.time()
         await self._set({ATTR_SWING_MODE: swing_mode})
 
     @property
@@ -536,6 +541,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_turn_on(self) -> None:
         """Turn device on."""
+        self._last_any_command_time = time.time()
         # Get the current mode from device to restore previous state
         current_daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
 
@@ -550,6 +556,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_turn_off(self) -> None:
         """Turn device off."""
+        self._last_any_command_time = time.time()
         await self._set({ATTR_HVAC_MODE: HVACMode.OFF})
 
     def _handle_coordinator_update(self) -> None:
