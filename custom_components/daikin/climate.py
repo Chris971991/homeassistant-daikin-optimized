@@ -142,6 +142,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         self._entity_init_time: str = dt_util.now().isoformat()
         # v2.36.0: Float timestamp for efficient startup grace comparison in override detection
         self._entity_init_timestamp: float = time.time()
+        # v2.37.0: Track ANY command sent (not just on/off) to suppress false override
+        # during mode transitions where Daikin bounces pow 1→0→1 (e.g., cool→fan_only)
+        self._last_any_command_time: float | None = None
 
         # v2.36.0: Persistent expected state for blueprint override detection.
         # Unlike optimistic state (clears after 30s), these persist for up to 1 hour
@@ -260,6 +263,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             # v2.34.0: Yield to event loop so state_changed event is processed
             # This pushes the update to frontend BEFORE blocking device.set()
             await asyncio.sleep(0)
+
+            # v2.37.0: Track ANY command for mode-transition pow bounce suppression
+            self._last_any_command_time = time.time()
 
             try:
                 # v2.32.0: SIMPLIFIED - Never pass expected_pow to pydaikin
@@ -566,6 +572,17 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 )
                 self._last_known_pow = current_pow
             # Fall through to optimistic state handling below (skip override detection)
+        elif self._last_any_command_time and (time.time() - self._last_any_command_time) < 30:
+            # v2.37.0: Mode transition grace period — suppress override detection for 30s
+            # after ANY command. Daikin units bounce pow 1→0→1 during mode transitions
+            # (e.g., cool→fan_only), which looks like a physical remote press.
+            if self._last_known_pow != current_pow:
+                _LOGGER.debug(
+                    "Mode transition grace (%.1fs since last command): pow %s -> %s, suppressing detection. entity=%s",
+                    time.time() - self._last_any_command_time,
+                    self._last_known_pow, current_pow, self.entity_id
+                )
+                self._last_known_pow = current_pow
         elif self._last_known_pow == '1' and current_pow == '0':
             # Debounce: skip if event was fired within last 5 seconds
             # This prevents race condition if _set() and coordinator fire simultaneously
