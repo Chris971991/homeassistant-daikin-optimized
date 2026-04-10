@@ -321,8 +321,20 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # leaving the AC in an inconsistent state. With shield(), the HTTP request
                 # completes even if the automation is cancelled, ensuring the command
                 # reaches the device.
+                # v2.38.0: Added 60s timeout to prevent hung device.set() from blocking
+                # the automation forever. Without this, asyncio.shield() keeps the task
+                # alive indefinitely if the device is unresponsive, preventing mode:restart.
                 try:
-                    result = await asyncio.shield(self.device.set(values))
+                    result = await asyncio.wait_for(
+                        asyncio.shield(self.device.set(values)),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        "_set() timed out after 60s. entity=%s, values=%s",
+                        self.entity_id, values
+                    )
+                    raise
                 except asyncio.CancelledError:
                     # shield() was cancelled but the inner task continues
                     # Log it but don't clear optimistic state - command is still running
@@ -579,7 +591,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 )
                 self._last_known_pow = current_pow
             # Fall through to optimistic state handling below (skip override detection)
-        elif self._last_any_command_time and (time.time() - self._last_any_command_time) < 30:
+        elif self._last_any_command_time and (time.time() - self._last_any_command_time) < 45:
             # v2.37.0: Mode transition grace period — suppress override detection for 30s
             # after ANY command. Daikin units bounce pow 1→0→1 during mode transitions
             # (e.g., cool→fan_only), which looks like a physical remote press.
