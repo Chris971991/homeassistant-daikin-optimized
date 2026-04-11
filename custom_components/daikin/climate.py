@@ -402,6 +402,11 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         """Set new target temperature."""
         # v2.37.1: Set command time BEFORE _set() to survive mode:restart cancellation
         self._last_any_command_time = time.time()
+        # v2.39.0: Set expected state BEFORE _set() to survive mode:restart cancellation
+        if ATTR_HVAC_MODE in kwargs:
+            hvac = kwargs[ATTR_HVAC_MODE]
+            self._expected_hvac_mode = hvac.value if isinstance(hvac, HVACMode) else str(hvac)
+            self._expected_set_time = time.time()
         await self._set(kwargs)
 
     @property
@@ -467,6 +472,8 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
         self._last_any_command_time = time.time()
+        self._expected_hvac_mode = hvac_mode.value if isinstance(hvac_mode, HVACMode) else str(hvac_mode)
+        self._expected_set_time = time.time()
         await self._set({ATTR_HVAC_MODE: hvac_mode})
 
     @property
@@ -564,11 +571,15 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             # Restore the mode that was set before it was turned off
             target_mode = DAIKIN_TO_HA_STATE.get(current_daikin_mode, HVACMode.HEAT_COOL)
 
+        self._expected_hvac_mode = target_mode.value if isinstance(target_mode, HVACMode) else str(target_mode)
+        self._expected_set_time = time.time()
         await self._set({ATTR_HVAC_MODE: target_mode})
 
     async def async_turn_off(self) -> None:
         """Turn device off."""
         self._last_any_command_time = time.time()
+        self._expected_hvac_mode = 'off'
+        self._expected_set_time = time.time()
         await self._set({ATTR_HVAC_MODE: HVACMode.OFF})
 
     def _handle_coordinator_update(self) -> None:
