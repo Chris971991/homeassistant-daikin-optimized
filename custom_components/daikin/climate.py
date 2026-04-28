@@ -142,6 +142,11 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         self._entity_init_time: str = dt_util.now().isoformat()
         # v2.36.0: Float timestamp for efficient startup grace comparison in override detection
         self._entity_init_timestamp: float = time.time()
+        # v2.36.0: Track coordinator state for reconnect-grace logic.
+        # Init from current coordinator state (not hardcoded True) — first_refresh
+        # has already completed at this point per HA setup ordering, so this reflects reality.
+        self._last_coordinator_success: bool = self.coordinator.last_update_success
+        self._last_coordinator_recovery_time: float | None = None
         # v2.37.0: Track ANY command sent (not just on/off) to suppress false override
         # during mode transitions where Daikin bounces pow 1→0→1 (e.g., cool→fan_only)
         self._last_any_command_time: float | None = None
@@ -584,21 +589,44 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
+        # v2.36.0: Detect coordinator recovery (device reboot / network outage / power cut).
+        # Only apply grace if the device's pow value actually CHANGED across the outage —
+        # benign network blips where state didn't change shouldn't suppress real-remote
+        # detection that happens AFTER recovery.
+        coordinator_success = self.coordinator.last_update_success
+        if coordinator_success and not self._last_coordinator_success:
+            current_pow_at_recovery = self.device.values.get('pow', '1')
+            if self._last_known_pow != current_pow_at_recovery:
+                self._last_coordinator_recovery_time = time.time()
+                _LOGGER.info(
+                    "Coordinator recovered with pow change (%s -> %s) - applying 60s reconnect grace. entity=%s",
+                    self._last_known_pow, current_pow_at_recovery, self.entity_id
+                )
+            else:
+                _LOGGER.debug(
+                    "Coordinator recovered, pow unchanged (%s) - no grace needed. entity=%s",
+                    self._last_known_pow, self.entity_id
+                )
+        self._last_coordinator_success = coordinator_success
+
         # ===== PHYSICAL REMOTE OVERRIDE DETECTION =====
         # Detect when AC turns OFF unexpectedly (user pressed remote)
         # Fire event so blueprint can set Override mode
         current_pow = self.device.values.get('pow', '1')
 
-        # v2.36.0: Startup grace period - during first 60 seconds after entity init,
-        # silently sync _last_known_pow without firing override events.
-        # Prevents false positives from power outage reboots or init() vs first-poll
-        # state differences where _last_known_pow doesn't match actual device state.
+        # v2.36.0: Startup/reconnect grace period - silently sync _last_known_pow without
+        # firing override events. Prevents false positives from:
+        # - First 60s after entity init (HA startup, integration reload)
+        # - First 60s after coordinator reconnect with pow change (device reboot, network outage)
         _init_age = time.time() - self._entity_init_timestamp
-        if _init_age < 60:
+        _recovery_age = (time.time() - self._last_coordinator_recovery_time) if self._last_coordinator_recovery_time else 9999
+        in_grace = _init_age < 60 or _recovery_age < 60
+        if in_grace:
             if self._last_known_pow != current_pow:
+                _grace_reason = "startup" if _init_age < 60 else "reconnect"
                 _LOGGER.debug(
-                    "Startup grace period (%.1fs): syncing _last_known_pow %s -> %s without detection. entity=%s",
-                    _init_age, self._last_known_pow, current_pow, self.entity_id
+                    "%s grace period (init=%.1fs, recovery=%.1fs): syncing _last_known_pow %s -> %s without detection. entity=%s",
+                    _grace_reason, _init_age, _recovery_age, self._last_known_pow, current_pow, self.entity_id
                 )
                 self._last_known_pow = current_pow
             # Fall through to optimistic state handling below (skip override detection)
