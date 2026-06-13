@@ -4,14 +4,17 @@ import asyncio
 from datetime import timedelta
 import logging
 
+from aiohttp import ClientError
+from aiohttp.web_exceptions import HTTPForbidden
 from pydaikin.daikin_base import Appliance
 from pydaikin.exceptions import DaikinException
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .const import COORDINATOR_UPDATE_TIMEOUT, DEFAULT_UPDATE_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,9 +39,20 @@ class DaikinCoordinator(DataUpdateCoordinator[None]):
 
     async def _async_update_data(self) -> None:
         """Fetch data from Daikin device."""
+        name = self.device.values.get("name", "device")
         try:
-            await self.device.update_status()
+            async with asyncio.timeout(COORDINATOR_UPDATE_TIMEOUT):
+                await self.device.update_status()
+        except HTTPForbidden as err:
+            # pydaikin raises HTTPForbidden on a genuine 403 — credentials are
+            # wrong/expired, so suspend polling and start reauth.
+            # Cross-cluster contract: for multi-resource base-class devices this
+            # only fires once pydaikin's H3 fix lands (TaskGroup currently
+            # swallows single-task failures); the mapping is correct to land now.
+            raise ConfigEntryAuthFailed(f"Authentication failed for {name}") from err
         except asyncio.TimeoutError as err:
-            raise UpdateFailed(f"Timeout communicating with {self.device.values.get('name', 'device')}") from err
+            raise UpdateFailed(f"Timeout communicating with {name}") from err
         except DaikinException as err:
-            raise UpdateFailed(f"Error communicating with {self.device.values.get('name', 'device')}: {err}") from err
+            raise UpdateFailed(f"Error communicating with {name}: {err}") from err
+        except (ClientError, ValueError) as err:
+            raise UpdateFailed(f"Error communicating with {name}: {err!r}") from err

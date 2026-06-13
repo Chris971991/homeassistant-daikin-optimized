@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import logging
 import ssl
 from typing import Any
@@ -15,9 +16,10 @@ from pydaikin.exceptions import DaikinException
 from pydaikin.factory import DaikinFactory
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PASSWORD, CONF_UUID
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import DOMAIN, KEY_MAC, TIMEOUT
@@ -30,6 +32,8 @@ def get_daikin_ssl_context() -> ssl.SSLContext:
     ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
+    # SSL_OP_LEGACY_SERVER_CONNECT — BRP072C legacy firmware needs legacy renegotiation
+    ssl_context.options |= 0x4
     # Lower security level to allow legacy Daikin SSL/TLS configurations
     # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
     try:
@@ -83,6 +87,20 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
             },
         )
 
+    def _is_expected_device(self, entry: ConfigEntry, device: Appliance) -> bool:
+        """Check the connected device is the unit this entry was created for.
+
+        format_mac BOTH sides: entry.unique_id holds the raw pydaikin mac while
+        entry.data[KEY_MAC] may hold the dr.format_mac() variant after the
+        __init__.py migration — a direct string compare would false-mismatch.
+        """
+        expected = entry.unique_id or entry.data.get(KEY_MAC)
+        if not expected:
+            # Degenerate legacy entry with neither unique_id nor stored MAC —
+            # skip the check and proceed as before.
+            return True
+        return format_mac(device.mac) == format_mac(expected)
+
     async def _create_device(
         self, host: str, key: str | None = None, password: str | None = None
     ) -> ConfigFlowResult:
@@ -97,6 +115,8 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
         if not password:
             password = None
 
+        # Build the SSL context in the executor — loading certs is blocking I/O
+        ssl_context = await self.hass.async_add_executor_job(get_daikin_ssl_context)
         try:
             async with asyncio.timeout(TIMEOUT):
                 device: Appliance = await DaikinFactory(
@@ -105,7 +125,7 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                     key=key,
                     uuid=uuid,
                     password=password,
-                    ssl_context=get_daikin_ssl_context(),
+                    ssl_context=ssl_context,
                 )
         except (TimeoutError, ClientError):
             self.host = None
@@ -190,6 +210,8 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
         password = user_input.get(CONF_PASSWORD) or None
         uuid = str(uuid4()) if key else None
 
+        # Build the SSL context in the executor — loading certs is blocking I/O
+        ssl_context = await self.hass.async_add_executor_job(get_daikin_ssl_context)
         try:
             async with asyncio.timeout(TIMEOUT):
                 device: Appliance = await DaikinFactory(
@@ -198,7 +220,7 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                     key=key,
                     uuid=uuid,
                     password=password,
-                    ssl_context=get_daikin_ssl_context(),
+                    ssl_context=ssl_context,
                 )
         except (TimeoutError, ClientError):
             return self.async_show_form(
@@ -214,6 +236,11 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                 errors={"base": "unknown"},
             )
 
+        # Verify the device at the new address is the SAME unit — entering
+        # another unit's IP would silently swap devices and collide unique_ids
+        if not self._is_expected_device(entry, device):
+            return self.async_abort(reason="wrong_device")
+
         # Update the config entry
         return self.async_update_reload_and_abort(
             entry,
@@ -226,12 +253,100 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
             },
         )
 
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication triggered by ConfigEntryAuthFailed."""
+        self.host = entry_data[CONF_HOST]
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for fresh credentials and validate them against the device."""
+        errors: dict[str, str] = {}
+        reauth_schema = vol.Schema(
+            {
+                vol.Optional(CONF_API_KEY): str,
+                vol.Optional(CONF_PASSWORD): str,
+            }
+        )
+
+        if user_input is not None:
+            key = user_input.get(CONF_API_KEY) or None
+            password = user_input.get(CONF_PASSWORD) or None
+            uuid = str(uuid4()) if key else None
+
+            # Build the SSL context in the executor — loading certs is blocking I/O
+            ssl_context = await self.hass.async_add_executor_job(
+                get_daikin_ssl_context
+            )
+            try:
+                async with asyncio.timeout(TIMEOUT):
+                    device: Appliance = await DaikinFactory(
+                        self.host,
+                        async_get_clientsession(self.hass),
+                        key=key,
+                        uuid=uuid,
+                        password=password,
+                        ssl_context=ssl_context,
+                    )
+            except web_exceptions.HTTPForbidden:
+                errors["base"] = "invalid_auth"
+            except (TimeoutError, ClientError):
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error during reauth")
+                errors["base"] = "unknown"
+            else:
+                entry = self.hass.config_entries.async_get_entry(
+                    self.context["entry_id"]
+                )
+                if not self._is_expected_device(entry, device):
+                    return self.async_abort(reason="wrong_device")
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data={
+                        **entry.data,
+                        CONF_API_KEY: key,
+                        CONF_UUID: uuid,
+                        CONF_PASSWORD: password,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=reauth_schema,
+            errors=errors,
+        )
+
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
     ) -> ConfigFlowResult:
         """Prepare configuration for a discovered Daikin device."""
         _LOGGER.debug("Zeroconf user_input: %s", discovery_info)
-        devices = Discovery().poll(ip=discovery_info.host)
+
+        def _discover() -> list[dict]:
+            """Run UDP discovery off the event loop.
+
+            Both the Discovery() constructor (socket bind, can raise OSError if
+            UDP 30000 is taken) and poll() (~1s of blocking recv) block, so the
+            whole closure runs in the executor. The socket is closed afterwards
+            — pydaikin's Discovery never closes it (fd leak / busy-port risk).
+            """
+            discovery = Discovery()
+            try:
+                return list(discovery.poll(ip=discovery_info.host))
+            finally:
+                discovery.sock.close()
+
+        try:
+            devices = await self.hass.async_add_executor_job(_discover)
+        except OSError as err:
+            _LOGGER.debug(
+                "UDP discovery failed for %s: %s", discovery_info.host, err
+            )
+            return self.async_abort(reason="cannot_connect")
         if not devices:
             _LOGGER.debug(
                 (
@@ -241,7 +356,7 @@ class FlowHandler(ConfigFlow, domain=DOMAIN):
                 discovery_info.host,
             )
             return self.async_abort(reason="cannot_connect")
-        await self.async_set_unique_id(next(iter(devices))[KEY_MAC])
+        await self.async_set_unique_id(devices[0][KEY_MAC])
         self._abort_if_unique_id_configured()
         self.host = discovery_info.host
         return await self.async_step_user()

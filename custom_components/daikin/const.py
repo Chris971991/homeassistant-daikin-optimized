@@ -26,6 +26,13 @@ KEY_IP = "ip"
 
 TIMEOUT = 60
 
+# Overall ceiling for one coordinator poll (seconds).
+# 90s: above pydaikin's worst-case tenacity budget (3x20s + backoff ~= 62s) and
+# above 4 serialized 20s requests on MAX_CONCURRENT_REQUESTS=1 BRP069 devices
+# once energy resources return. Still bounds hung polls — DataUpdateCoordinator
+# debounces overlapping refreshes, so a >interval poll does not pile up.
+COORDINATOR_UPDATE_TIMEOUT = 90
+
 # Default polling interval for state updates (seconds)
 # Reduced to 10s for better responsiveness to manual remote changes
 # Can be overridden via options flow in the future

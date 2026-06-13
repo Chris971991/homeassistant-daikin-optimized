@@ -39,6 +39,18 @@ from .coordinator import DaikinConfigEntry, DaikinCoordinator
 from .entity import DaikinEntity
 
 
+def _round2(value: float | None) -> float | None:
+    """Round to 2 decimals, passing None through (sensor shows unknown).
+
+    The power-mixin and energy_consumption properties (current_total_power_consumption,
+    last_hour_cool/heat_energy_consumption, today_total_energy_consumption) can return
+    None before energy data is populated; today_energy_consumption currently cannot
+    (pydaikin coalesces with `or 0`) but is wrapped anyway for uniformity and to
+    future-proof against pydaikin changes.
+    """
+    return None if value is None else round(value, 2)
+
+
 @dataclass(frozen=True, kw_only=True)
 class DaikinSensorEntityDescription(SensorEntityDescription):
     """Describes Daikin sensor entity."""
@@ -76,7 +88,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.HUMIDITY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=PERCENTAGE,
-        value_func=lambda device: device.humidity,
+        value_func=lambda device: device.target_humidity,
     ),
     DaikinSensorEntityDescription(
         key=ATTR_TOTAL_POWER,
@@ -84,7 +96,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfPower.KILO_WATT,
-        value_func=lambda device: round(device.current_total_power_consumption, 2),
+        value_func=lambda device: _round2(device.current_total_power_consumption),
     ),
     DaikinSensorEntityDescription(
         key=ATTR_COOL_ENERGY,
@@ -92,7 +104,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         entity_registry_enabled_default=False,
-        value_func=lambda device: round(device.last_hour_cool_energy_consumption, 2),
+        value_func=lambda device: _round2(device.last_hour_cool_energy_consumption),
     ),
     DaikinSensorEntityDescription(
         key=ATTR_HEAT_ENERGY,
@@ -100,7 +112,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         entity_registry_enabled_default=False,
-        value_func=lambda device: round(device.last_hour_heat_energy_consumption, 2),
+        value_func=lambda device: _round2(device.last_hour_heat_energy_consumption),
     ),
     DaikinSensorEntityDescription(
         key=ATTR_ENERGY_TODAY,
@@ -108,7 +120,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        value_func=lambda device: round(device.today_energy_consumption, 2),
+        value_func=lambda device: _round2(device.today_energy_consumption),
     ),
     DaikinSensorEntityDescription(
         key=ATTR_COMPRESSOR_FREQUENCY,
@@ -126,7 +138,7 @@ SENSOR_TYPES: tuple[DaikinSensorEntityDescription, ...] = (
         state_class=SensorStateClass.TOTAL_INCREASING,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         entity_registry_enabled_default=False,
-        value_func=lambda device: round(device.today_total_energy_consumption, 2),
+        value_func=lambda device: _round2(device.today_total_energy_consumption),
     ),
 )
 

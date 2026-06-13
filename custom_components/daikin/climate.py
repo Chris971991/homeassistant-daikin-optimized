@@ -26,7 +26,9 @@ from homeassistant.components.climate import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from pydaikin.exceptions import DaikinException
 
 from .const import (
     ATTR_INSIDE_TEMPERATURE,
@@ -133,11 +135,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         self._last_known_pow: str = self.device.values.get('pow', '1')
         # Debounce: prevent duplicate override events from race conditions
         self._last_override_event_time: float | None = None
-        # Track when we last sent an OFF command - prevents false override detection
-        # when blueprint flip-flops OFF→ON rapidly (race condition edge case)
-        self._last_off_command_time: float | None = None
-        # Track when we last sent an ON command - prevents false turn-ON override detection
-        self._last_on_command_time: float | None = None
         # Track entity initialization time for startup grace period (timezone-aware)
         self._entity_init_time: str = dt_util.now().isoformat()
         # v2.36.0: Float timestamp for efficient startup grace comparison in override detection
@@ -156,6 +153,14 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         # so the blueprint can detect manual overrides well after the last command.
         self._expected_hvac_mode: str | None = None
         self._expected_set_time: float | None = None
+        # v2.40.0: Snapshot of expected state from before the in-flight command,
+        # restored if that command fails (a failed command must not blind the
+        # blueprint's expected-vs-actual safety net).
+        self._expected_state_snapshot: tuple[str | None, float | None] | None = None
+        # v2.40.0: Last coordinator-CONFIRMED active (non-off) HVAC mode.
+        # Written only in _handle_coordinator_update, mirroring _last_known_pow.
+        # Used by async_turn_on to restore the pre-off mode.
+        self._last_active_hvac_mode: HVACMode | None = None
 
         self._attr_supported_features = (
             ClimateEntityFeature.TURN_ON
@@ -172,43 +177,21 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         if self.device.support_swing_mode:
             self._attr_supported_features |= ClimateEntityFeature.SWING_MODE
 
-    def _get_control_mode_entity_id(self) -> str | None:
-        """Derive the control mode helper entity_id from climate entity_id.
+    def _record_expected_state(self, hvac_mode: HVACMode | str) -> None:
+        """Record expected HVAC mode for the blueprint's safety-net detection.
 
-        The blueprint creates input_select.climate_control_mode_{room} helpers.
-        We derive the room name from our entity_id (e.g., climate.office_a_c -> office).
+        Snapshots the previous expected state first so a failed command can
+        roll back to the last truthful value instead of wiping it.
+        Called BEFORE _set() so the record survives mode:restart cancellation.
         """
-        if not self.entity_id:
-            return None
-
-        try:
-            # Remove 'climate.' prefix
-            name = self.entity_id.replace("climate.", "")
-            # Remove common AC suffixes
-            for suffix in ["_a_c", "_ac", "_aircon", "_hvac", "_air_conditioner"]:
-                if name.lower().endswith(suffix):
-                    name = name[: -len(suffix)]
-                    break
-
-            if name:
-                return f"input_select.climate_control_mode_{name}"
-        except Exception:
-            pass
-        return None
-
-    def _is_blueprint_override_active(self) -> bool:
-        """Check if the blueprint's control mode is set to Override."""
-        helper_entity_id = self._get_control_mode_entity_id()
-        if not helper_entity_id:
-            return False
-
-        try:
-            state = self.hass.states.get(helper_entity_id)
-            if state is None:
-                return False
-            return state.state.lower() == "override"
-        except Exception:
-            return False
+        self._expected_state_snapshot = (
+            self._expected_hvac_mode,
+            self._expected_set_time,
+        )
+        self._expected_hvac_mode = (
+            hvac_mode.value if isinstance(hvac_mode, HVACMode) else str(hvac_mode)
+        )
+        self._expected_set_time = time.time()
 
     async def _set(self, settings: dict[str, Any]) -> None:
         """Set device settings using API."""
@@ -226,10 +209,12 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 if attr == ATTR_HVAC_MODE:
                     values[daikin_attr] = HA_STATE_TO_DAIKIN[value]
                 elif value in self._list[attr]:
-                    # Don't use .lower() - pydaikin's human_to_daikin() expects title case
-                    values[daikin_attr] = value
+                    # pydaikin human_to_daikin() reverse-map keys are lowercase
+                    # (TRANSLATIONS values); device.fan_rate/swing_modes
+                    # title-case only for display
+                    values[daikin_attr] = value.lower()
                 else:
-                    _LOGGER.error("Invalid value %s for %s", attr, value)
+                    raise ServiceValidationError(f"Invalid {attr} value: {value!r}")
 
             # temperature
             elif attr == ATTR_TEMPERATURE:
@@ -257,11 +242,12 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             # Record timestamp for staleness detection
             self._optimistic_set_time = time.time()
 
-            # v2.36.0: Update persistent expected state for blueprint override detection
-            # These persist independently of optimistic state (which clears after 30s)
-            if ATTR_HVAC_MODE in settings:
-                self._expected_hvac_mode = settings[ATTR_HVAC_MODE].value if isinstance(settings[ATTR_HVAC_MODE], HVACMode) else str(settings[ATTR_HVAC_MODE])
-            self._expected_set_time = time.time()
+            # Persistent expected state is recorded by the public handlers via
+            # _record_expected_state() BEFORE this method runs (survives
+            # mode:restart cancellation). No duplicate write here: it would
+            # corrupt the rollback snapshot, and the old unconditional
+            # _expected_set_time refresh let fan/temp-only commands extend a
+            # stale expected_hvac_mode past its 1h expiry.
 
             # Trigger immediate UI update
             self.async_write_ha_state()
@@ -275,44 +261,11 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             try:
                 # v2.32.0: SIMPLIFIED - Never pass expected_pow to pydaikin
                 # Physical remote detection is handled ONLY via coordinator polling in
-                # _handle_coordinator_update(). The expected_pow check in pydaikin caused
-                # too many false positives due to stale _last_known_pow after HA restarts,
-                # timing issues, and race conditions.
-                #
-                # v2.33.0: DO NOT update _last_known_pow here! Let coordinator do it.
-                # _last_known_pow must reflect CONFIRMED device state, not what we asked for.
-                # Only update command timestamps for the protection window.
-                if ATTR_HVAC_MODE in settings:
-                    if settings[ATTR_HVAC_MODE] == HVACMode.OFF:
-                        # v2.34.0: Only set _last_off_command_time when ACTUALLY turning OFF from ON
-                        # If AC is already OFF (last_known_pow='0'), don't update the timestamp
-                        if self._last_known_pow != '0':
-                            self._last_off_command_time = time.time()
-                            _LOGGER.debug(
-                                "Sending OFF command (from ON), setting _last_off_command_time. entity=%s",
-                                self.entity_id
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "AC already OFF, not updating _last_off_command_time. entity=%s",
-                                self.entity_id
-                            )
-                    else:
-                        # v2.34.0: Only set _last_on_command_time when ACTUALLY turning ON from OFF
-                        # If AC is already ON (last_known_pow='1'), don't update the timestamp
-                        # Otherwise automation constantly refreshing settings keeps resetting the
-                        # protection window and override detection never fires
-                        if self._last_known_pow != '1':
-                            self._last_on_command_time = time.time()
-                            _LOGGER.debug(
-                                "Sending ON command (from OFF), setting _last_on_command_time. entity=%s",
-                                self.entity_id
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "AC already ON, not updating _last_on_command_time. entity=%s",
-                                self.entity_id
-                            )
+                # _handle_coordinator_update().
+                # DO NOT update _last_known_pow here — coordinator only.
+                # The 45s any-command grace (_last_any_command_time) is the
+                # sole command protection window; the old 30s ON/OFF windows
+                # were unreachable under it and have been removed (v2.40.0).
 
                 # v2.35.0: Added detailed logging to trace command execution
                 _LOGGER.debug(
@@ -327,16 +280,49 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # completes even if the automation is cancelled, ensuring the command
                 # reaches the device.
                 # v2.38.0: Added 60s timeout to prevent hung device.set() from blocking
-                # the automation forever. Without this, asyncio.shield() keeps the task
-                # alive indefinitely if the device is unresponsive, preventing mode:restart.
+                # the automation forever.
+                # v2.40.0: Explicit task + done-callback. device.set() can
+                # legitimately outlive the 45s grace (60s wait_for, BRP084
+                # clipping retries) — the device's own pow flip would then land
+                # OUTSIDE the grace and fire a false override against our own
+                # command. The callback re-stamps _last_any_command_time when
+                # the command ACTUALLY completes (success, error, or cancel),
+                # so the grace is measured from completion. It also retrieves
+                # the orphaned task's exception, silencing asyncio's
+                # 'exception was never retrieved'. The pre-call stamp stays —
+                # both are required (in-flight window + completion window).
+                # Note: hass.async_create_task makes the set task
+                # HA-shutdown-cancellable (the old anonymous shield task was
+                # untracked); the callback's cancelled() branch handles that.
+                set_task = self.hass.async_create_task(
+                    self.device.set(values),
+                    name=f"daikin_set_{self.entity_id}",
+                )
+
+                def _on_set_complete(task: asyncio.Task) -> None:
+                    self._last_any_command_time = time.time()
+                    if task.cancelled():
+                        _LOGGER.warning(
+                            "device.set() cancelled before completion. entity=%s values=%s",
+                            self.entity_id, values
+                        )
+                    elif (exc := task.exception()) is not None:
+                        _LOGGER.warning(
+                            "Shielded device.set() finished with error %r. entity=%s values=%s",
+                            exc, self.entity_id, values
+                        )
+
+                set_task.add_done_callback(_on_set_complete)
+
                 try:
                     result = await asyncio.wait_for(
-                        asyncio.shield(self.device.set(values)),
+                        asyncio.shield(set_task),
                         timeout=60.0
                     )
                 except asyncio.TimeoutError:
                     _LOGGER.warning(
-                        "_set() timed out after 60s. entity=%s, values=%s",
+                        "_set() timed out after 60s (command may still complete "
+                        "in the background). entity=%s, values=%s",
                         self.entity_id, values
                     )
                     raise
@@ -362,16 +348,21 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # Don't clear optimistic state here - let _handle_coordinator_update() do it
                 # when real device state arrives. This keeps UI responsive without flickering.
             except Exception as e:
-                # Check if this is a network timeout or cancellation
-                error_msg = str(e)
+                # repr(e), not str(e): str(TimeoutError()) is '' which both
+                # hid the message and defeated the old substring check.
                 _LOGGER.warning(
-                    "_set() EXCEPTION: %s: %s. entity=%s, values=%s",
-                    type(e).__name__, error_msg, self.entity_id, values
+                    "_set() EXCEPTION: %r. entity=%s, values=%s",
+                    e, self.entity_id, values
                 )
-                if "timeout" in error_msg.lower() or "cancel" in error_msg.lower():
-                    _LOGGER.warning("Network timeout communicating with device: %s", error_msg)
+                # Routine timeouts -> WARNING; everything else -> ERROR.
+                # BRP084 wraps its 20s HTTP timeouts in DaikinException with
+                # 'timeout' in the message (contract pinned by pydaikin test).
+                if isinstance(e, TimeoutError) or (
+                    isinstance(e, DaikinException) and "timeout" in str(e).lower()
+                ):
+                    _LOGGER.warning("Network timeout communicating with device: %r", e)
                 else:
-                    _LOGGER.error("Error setting device values: %s", e, exc_info=True)
+                    _LOGGER.error("Error setting device values: %r", e, exc_info=True)
 
                 # Clear optimistic state on failure
                 self._optimistic_target_temp = None
@@ -379,9 +370,20 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 self._optimistic_fan_mode = None
                 self._optimistic_swing_mode = None
                 self._optimistic_set_time = None
-                # v2.36.0: Clear persistent expected state too
-                self._expected_hvac_mode = None
-                self._expected_set_time = None
+                # v2.40.0: A failed MODE command rolls expected state back to
+                # the previous successful command's record (keeps the
+                # blueprint's expected-vs-actual safety net armed with
+                # truthful data). Failed fan/swing/temp-only commands never
+                # touched expected state, so nothing to do for them.
+                if (
+                    ATTR_HVAC_MODE in settings
+                    and self._expected_state_snapshot is not None
+                ):
+                    (
+                        self._expected_hvac_mode,
+                        self._expected_set_time,
+                    ) = self._expected_state_snapshot
+                    self._expected_state_snapshot = None
                 self.async_write_ha_state()
                 raise
 
@@ -409,9 +411,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         self._last_any_command_time = time.time()
         # v2.39.0: Set expected state BEFORE _set() to survive mode:restart cancellation
         if ATTR_HVAC_MODE in kwargs:
-            hvac = kwargs[ATTR_HVAC_MODE]
-            self._expected_hvac_mode = hvac.value if isinstance(hvac, HVACMode) else str(hvac)
-            self._expected_set_time = time.time()
+            self._record_expected_state(kwargs[ATTR_HVAC_MODE])
         await self._set(kwargs)
 
     @property
@@ -477,8 +477,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
         self._last_any_command_time = time.time()
-        self._expected_hvac_mode = hvac_mode.value if isinstance(hvac_mode, HVACMode) else str(hvac_mode)
-        self._expected_set_time = time.time()
+        self._record_expected_state(hvac_mode)
         await self._set({ATTR_HVAC_MODE: hvac_mode})
 
     @property
@@ -529,6 +528,10 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set preset mode."""
+        # v2.40.0: Presets arm the 45s grace like every other command path —
+        # away mode can change pow and powerful/econo can bounce reported
+        # state, which previously fired false physical-remote overrides.
+        self._last_any_command_time = time.time()
         try:
             if preset_mode == PRESET_AWAY:
                 await self.device.set_holiday(ATTR_STATE_ON)
@@ -553,6 +556,12 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         except Exception as e:
             _LOGGER.error("Error setting preset mode %s: %s", preset_mode, e, exc_info=True)
             raise
+        finally:
+            # Re-stamp from completion so slow preset round-trips stay graced
+            # (mirror of the _set() done-callback; these calls aren't shielded
+            # so a finally suffices).
+            self._last_any_command_time = time.time()
+
     @property
     def preset_modes(self) -> list[str]:
         """List of available preset modes."""
@@ -564,27 +573,23 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         return ret
 
     async def async_turn_on(self) -> None:
-        """Turn device on."""
+        """Turn device on, restoring the last coordinator-confirmed mode.
+
+        The old represent()-based restore was dead code: represent('mode')
+        returns 'off' whenever pow=0, which is always true during turn_on,
+        so it unconditionally fell back to HEAT_COOL.
+        Falls back to HEAT_COOL when no active mode was ever confirmed
+        (e.g. first turn_on after HA restart with the unit off).
+        """
         self._last_any_command_time = time.time()
-        # Get the current mode from device to restore previous state
-        current_daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
-
-        # If current mode is 'off', use auto mode as sensible default
-        if current_daikin_mode == 'off':
-            target_mode = HVACMode.HEAT_COOL  # Auto mode
-        else:
-            # Restore the mode that was set before it was turned off
-            target_mode = DAIKIN_TO_HA_STATE.get(current_daikin_mode, HVACMode.HEAT_COOL)
-
-        self._expected_hvac_mode = target_mode.value if isinstance(target_mode, HVACMode) else str(target_mode)
-        self._expected_set_time = time.time()
+        target_mode = self._last_active_hvac_mode or HVACMode.HEAT_COOL
+        self._record_expected_state(target_mode)
         await self._set({ATTR_HVAC_MODE: target_mode})
 
     async def async_turn_off(self) -> None:
         """Turn device off."""
         self._last_any_command_time = time.time()
-        self._expected_hvac_mode = 'off'
-        self._expected_set_time = time.time()
+        self._record_expected_state(HVACMode.OFF)
         await self._set({ATTR_HVAC_MODE: HVACMode.OFF})
 
     def _handle_coordinator_update(self) -> None:
@@ -631,7 +636,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 self._last_known_pow = current_pow
             # Fall through to optimistic state handling below (skip override detection)
         elif self._last_any_command_time and (time.time() - self._last_any_command_time) < 45:
-            # v2.37.0: Mode transition grace period — suppress override detection for 30s
+            # v2.37.0: Mode transition grace period — suppress override detection for 45s
             # after ANY command. Daikin units bounce pow 1→0→1 during mode transitions
             # (e.g., cool→fan_only), which looks like a physical remote press.
             if self._last_known_pow != current_pow:
@@ -642,18 +647,12 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 )
                 self._last_known_pow = current_pow
         elif self._last_known_pow == '1' and current_pow == '0':
+            # AC was ON (coordinator-confirmed), now OFF, and no command was
+            # sent within the 45s grace — physical remote press.
             # Debounce: skip if event was fired within last 5 seconds
             # This prevents race condition if _set() and coordinator fire simultaneously
             now = time.time()
             should_fire = True
-
-            # v2.31.0: Add debug logging to trace override detection
-            _LOGGER.debug(
-                "Turn-OFF detection triggered. entity=%s, _last_off_command_time=%s, age=%.1fs",
-                self.entity_id,
-                self._last_off_command_time,
-                (now - self._last_off_command_time) if self._last_off_command_time else -1
-            )
 
             if self._last_override_event_time and (now - self._last_override_event_time) < 5:
                 _LOGGER.debug(
@@ -661,38 +660,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                     now - self._last_override_event_time, self.entity_id
                 )
                 should_fire = False
-
-            # Skip if we recently sent an OFF command (within 30 seconds)
-            # This prevents false override detection when automation turns off AC
-            # and coordinator polls before _last_known_pow is updated
-            # v2.31.0: Increased from 15s to 30s - devices can take longer to process commands
-            if self._last_off_command_time and (now - self._last_off_command_time) < 30:
-                _LOGGER.debug(
-                    "Skipping turn-OFF override detection - we sent OFF %.1fs ago. entity=%s",
-                    now - self._last_off_command_time, self.entity_id
-                )
-                should_fire = False
-
-            # v2.32.0 FIX: Skip if we recently sent an ON command AND device hasn't confirmed ON yet
-            # When we send ON, device takes time to actually turn on. If coordinator polls before
-            # device processes ON, it sees pow=0 and thinks user turned OFF via remote.
-            # BUT: If _last_known_pow is already '1' (device confirmed ON), then seeing pow=0
-            # means user REALLY pressed OFF on remote - don't skip!
-            # v2.33.0: Only skip if device hasn't confirmed the ON command yet
-            if self._last_on_command_time and (now - self._last_on_command_time) < 30:
-                # Only skip if device hasn't confirmed ON yet (last_known_pow is still '0')
-                # If last_known_pow is '1', device confirmed ON, so pow=0 is a real remote press
-                if self._last_known_pow == '0':
-                    _LOGGER.debug(
-                        "Skipping turn-OFF override detection - we sent ON %.1fs ago and device hasn't confirmed yet. entity=%s",
-                        now - self._last_on_command_time, self.entity_id
-                    )
-                    should_fire = False
-                else:
-                    _LOGGER.debug(
-                        "NOT skipping turn-OFF override - device confirmed ON (last_known_pow=1), so pow=0 is real remote press. entity=%s",
-                        self.entity_id
-                    )
 
             if should_fire:
                 # AC was ON, now OFF - user turned it off via physical remote
@@ -706,7 +673,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                     "daikin_physical_remote_override",
                     {
                         "entity_id": self.entity_id,
-                        "device_name": self.name,
+                        # self.name is always None (_attr_name=None with
+                        # has_entity_name) — use the device-advertised name
+                        "device_name": self.device.values.get('name') or self.entity_id,
                         "action": "turned_off",
                     }
                 )
@@ -714,6 +683,8 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
         # Symmetric detection: AC turned ON unexpectedly (user turned on via physical remote)
         elif self._last_known_pow == '0' and current_pow == '1':
+            # AC was OFF (coordinator-confirmed), now ON, and no command was
+            # sent within the 45s grace — physical remote press.
             # Debounce: skip if event was fired within last 5 seconds
             now = time.time()
             should_fire = True
@@ -723,37 +694,6 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                     now - self._last_override_event_time, self.entity_id
                 )
                 should_fire = False
-
-            # Skip if we recently sent an ON command (within 30 seconds)
-            # This prevents false override detection when automation turns on AC
-            # and coordinator polls before _last_known_pow is updated
-            if self._last_on_command_time and (now - self._last_on_command_time) < 30:
-                _LOGGER.debug(
-                    "Skipping turn-ON override detection - we sent ON %.1fs ago. entity=%s",
-                    now - self._last_on_command_time, self.entity_id
-                )
-                should_fire = False
-
-            # v2.30.0 FIX: Skip if we recently sent an OFF command AND device hasn't confirmed OFF yet
-            # When we send OFF, device takes time to actually turn off. If coordinator polls before
-            # device processes OFF, it sees pow=1 and thinks user turned ON via remote.
-            # BUT: If _last_known_pow is already '0' (device confirmed OFF), then seeing pow=1
-            # means user REALLY pressed ON on remote - don't skip!
-            # v2.33.0: Only skip if device hasn't confirmed the OFF command yet
-            if self._last_off_command_time and (now - self._last_off_command_time) < 30:
-                # Only skip if device hasn't confirmed OFF yet (last_known_pow is still '1')
-                # If last_known_pow is '0', device confirmed OFF, so pow=1 is a real remote press
-                if self._last_known_pow == '1':
-                    _LOGGER.debug(
-                        "Skipping turn-ON override detection - we sent OFF %.1fs ago and device hasn't confirmed yet. entity=%s",
-                        now - self._last_off_command_time, self.entity_id
-                    )
-                    should_fire = False
-                else:
-                    _LOGGER.debug(
-                        "NOT skipping turn-ON override - device confirmed OFF (last_known_pow=0), so pow=1 is real remote press. entity=%s",
-                        self.entity_id
-                    )
 
             if should_fire:
                 # AC was OFF, now ON - user turned it on via physical remote
@@ -767,7 +707,7 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                     "daikin_physical_remote_override",
                     {
                         "entity_id": self.entity_id,
-                        "device_name": self.name,
+                        "device_name": self.device.values.get('name') or self.entity_id,
                         "action": "turned_on",
                     }
                 )
@@ -775,6 +715,17 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
         # Update last known power state
         self._last_known_pow = current_pow
+
+        # v2.40.0: Capture the coordinator-confirmed active mode for turn_on
+        # restore. BRP069 auto variants normalize to 'auto'; unmapped daikin
+        # modes are deliberately skipped (never stored wrong).
+        if current_pow == '1':
+            _daikin_mode = self.device.represent(HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE])[1]
+            if _daikin_mode in ('auto-1', 'auto-7'):
+                _daikin_mode = 'auto'
+            _ha_mode = DAIKIN_TO_HA_STATE.get(_daikin_mode)
+            if _ha_mode is not None and _ha_mode is not HVACMode.OFF:
+                self._last_active_hvac_mode = _ha_mode
 
         # ===== END PHYSICAL REMOTE DETECTION =====
 
@@ -864,7 +815,9 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         # Expected HVAC mode: persistent first, then optimistic fallback
         expected_hvac = self._expected_hvac_mode
         if expected_hvac is None and self._optimistic_hvac_mode is not None:
-            expected_hvac = self._optimistic_hvac_mode.value
+            expected_hvac = getattr(
+                self._optimistic_hvac_mode, 'value', str(self._optimistic_hvac_mode)
+            )
 
         # Last command time: persistent first, then optimistic fallback
         last_cmd_time = None

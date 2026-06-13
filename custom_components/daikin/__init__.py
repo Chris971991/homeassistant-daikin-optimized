@@ -34,6 +34,8 @@ def get_daikin_ssl_context() -> ssl.SSLContext:
     ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
+    # SSL_OP_LEGACY_SERVER_CONNECT — BRP072C legacy firmware needs legacy renegotiation
+    ssl_context.options |= 0x4
     # Lower security level to allow legacy Daikin SSL/TLS configurations
     # Fixes HA 2025.10 SSL WRONG_SIGNATURE_TYPE error
     try:
@@ -164,14 +166,17 @@ async def async_migrate_unique_id(
                 name=new_name,
             )
 
-        # Migrate entities
-        await er.async_migrate_entries(hass, config_entry.entry_id, _update_unique_id)
+    # Migrate entities and update the config entry exactly once, at function
+    # level — previously these ran once PER device entry (redundant) and ZERO
+    # times when the registry had no device entries for this config entry,
+    # silently skipping the migration.
+    await er.async_migrate_entries(hass, config_entry.entry_id, _update_unique_id)
 
-        new_data = {**config_entry.data, KEY_MAC: dr.format_mac(new_unique_id)}
+    new_data = {**config_entry.data, KEY_MAC: dr.format_mac(new_unique_id)}
 
-        hass.config_entries.async_update_entry(
-            config_entry, unique_id=new_unique_id, data=new_data
-        )
+    hass.config_entries.async_update_entry(
+        config_entry, unique_id=new_unique_id, data=new_data
+    )
 
 
 @callback
