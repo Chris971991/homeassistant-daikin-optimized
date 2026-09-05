@@ -14,7 +14,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import COORDINATOR_UPDATE_TIMEOUT, DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .const import (
+    COORDINATOR_UPDATE_TIMEOUT,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+    FAILED_POLLS_TOLERATED,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +41,29 @@ class DaikinCoordinator(DataUpdateCoordinator[None]):
             update_interval=timedelta(seconds=DEFAULT_UPDATE_INTERVAL),
         )
         self.device = device
+        # v2.42.0: count of consecutive failed polls. pydaikin applies every
+        # resource that DID succeed before raising, so the device values are
+        # as fresh as the network allowed even on a failed poll.
+        self._consecutive_failures = 0
+
+    def _tolerate_or_raise(self, message: str, err: BaseException) -> None:
+        """Swallow the first FAILED_POLLS_TOLERATED consecutive failures.
+
+        The entity keeps its last state and stays available; the next
+        failure in a row raises UpdateFailed exactly as before, so a real
+        outage still marks the entity unavailable and still arms the
+        climate entity's coordinator-recovery reconnect grace.
+        """
+        self._consecutive_failures += 1
+        if self._consecutive_failures <= FAILED_POLLS_TOLERATED:
+            _LOGGER.info(
+                "%s (failed poll %d of %d tolerated; keeping last state)",
+                message,
+                self._consecutive_failures,
+                FAILED_POLLS_TOLERATED,
+            )
+            return
+        raise UpdateFailed(message) from err
 
     async def _async_update_data(self) -> None:
         """Fetch data from Daikin device."""
@@ -51,8 +79,10 @@ class DaikinCoordinator(DataUpdateCoordinator[None]):
             # swallows single-task failures); the mapping is correct to land now.
             raise ConfigEntryAuthFailed(f"Authentication failed for {name}") from err
         except asyncio.TimeoutError as err:
-            raise UpdateFailed(f"Timeout communicating with {name}") from err
+            self._tolerate_or_raise(f"Timeout communicating with {name}", err)
         except DaikinException as err:
-            raise UpdateFailed(f"Error communicating with {name}: {err}") from err
+            self._tolerate_or_raise(f"Error communicating with {name}: {err}", err)
         except (ClientError, ValueError) as err:
-            raise UpdateFailed(f"Error communicating with {name}: {err!r}") from err
+            self._tolerate_or_raise(f"Error communicating with {name}: {err!r}", err)
+        else:
+            self._consecutive_failures = 0

@@ -37,3 +37,10 @@ COORDINATOR_UPDATE_TIMEOUT = 90
 # Reduced to 10s for better responsiveness to manual remote changes
 # Can be overridden via options flow in the future
 DEFAULT_UPDATE_INTERVAL = 10
+
+# v2.42.0: consecutive failed polls kept out of sight before the entity goes
+# unavailable. One failed poll used to mean ~10s of 'unavailable', which the
+# climate blueprint reads as 'AC off' (observed 23 times in one night on a
+# BRP072C, every one a single dead keep-alive socket while the rest of the poll
+# succeeded). With 1 tolerated, a real outage shows after two polls (~20s).
+FAILED_POLLS_TOLERATED = 1
