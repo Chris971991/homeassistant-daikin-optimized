@@ -36,10 +36,12 @@ async def async_setup_entry(
             for zone_id, zone in enumerate(zones)
             if zone[0] != "-"
         )
-    if daikin_api.device.support_advanced_modes:
-        # It isn't possible to find out from the API responses if a specific
-        # device supports the streamer, so assume so if it does support
-        # advanced modes.
+    # v2.44.0: aircon/get_model_info's en_spmode bit 2 does say whether the unit
+    # has a streamer (pydaikin support_streamer_mode); when the unit does not
+    # report en_spmode this falls back to the old 'has advanced modes' guess.
+    if daikin_api.device.support_advanced_modes and getattr(
+        daikin_api.device, "support_streamer_mode", True
+    ):
         switches.append(DaikinStreamerSwitch(daikin_api))
     switches.append(DaikinToggleSwitch(daikin_api))
     async_add_entities(switches)

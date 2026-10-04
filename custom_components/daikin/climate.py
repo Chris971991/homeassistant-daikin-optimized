@@ -26,7 +26,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from pydaikin.exceptions import DaikinException
 
@@ -168,7 +168,13 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             | ClimateEntityFeature.TARGET_TEMPERATURE
         )
 
-        if self.device.support_away_mode or self.device.support_advanced_modes:
+        if self.device.support_away_mode or (
+            self.device.support_advanced_modes
+            and (
+                getattr(self.device, "support_econo_mode", True)
+                or getattr(self.device, "support_powerful_mode", True)
+            )
+        ):
             self._attr_supported_features |= ClimateEntityFeature.PRESET_MODE
 
         if self.device.support_fan_rate:
@@ -385,7 +391,14 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                     ) = self._expected_state_snapshot
                     self._expected_state_snapshot = None
                 self.async_write_ha_state()
-                raise
+                if isinstance(e, HomeAssistantError):
+                    raise
+                # v2.44.0: re-raise device/network faults as HomeAssistantError.
+                # HA only honours a script's continue_on_error for
+                # HomeAssistantError, so a raw DaikinException/TimeoutError used
+                # to abort the blueprint run even where the step was marked
+                # optional. The original exception stays chained.
+                raise HomeAssistantError(f"Daikin command failed: {e!r}") from e
 
     @property
     def unique_id(self) -> str:
@@ -555,7 +568,10 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 )
         except Exception as e:
             _LOGGER.error("Error setting preset mode %s: %s", preset_mode, e, exc_info=True)
-            raise
+            if isinstance(e, HomeAssistantError):
+                raise
+            # v2.44.0: see _set(); keeps continue_on_error effective for presets.
+            raise HomeAssistantError(f"Daikin preset {preset_mode} failed: {e!r}") from e
         finally:
             # Re-stamp from completion so slow preset round-trips stay graced
             # (mirror of the _set() done-callback; these calls aren't shielded
@@ -568,8 +584,14 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         ret = [PRESET_NONE]
         if self.device.support_away_mode:
             ret.append(PRESET_AWAY)
+        # v2.44.0: only the special modes the unit reports (en_spmode). The
+        # house's BRP072C units carry an empty 'adv' field but report
+        # en_spmode=0 and reject Powerful with PARAM NG.
         if self.device.support_advanced_modes:
-            ret += [PRESET_ECO, PRESET_BOOST]
+            if getattr(self.device, "support_econo_mode", True):
+                ret.append(PRESET_ECO)
+            if getattr(self.device, "support_powerful_mode", True):
+                ret.append(PRESET_BOOST)
         return ret
 
     async def async_turn_on(self) -> None:
