@@ -30,6 +30,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from pydaikin.exceptions import DaikinException
 
+from .command_queue import CommandQueue
 from .const import (
     ATTR_INSIDE_TEMPERATURE,
     ATTR_OUTSIDE_TEMPERATURE,
@@ -153,10 +154,22 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
         # so the blueprint can detect manual overrides well after the last command.
         self._expected_hvac_mode: str | None = None
         self._expected_set_time: float | None = None
-        # v2.40.0: Snapshot of expected state from before the in-flight command,
-        # restored if that command fails (a failed command must not blind the
-        # blueprint's expected-vs-actual safety net).
-        self._expected_state_snapshot: tuple[str | None, float | None] | None = None
+        # v2.45.0: Expected state recorded by the last mode command the device
+        # ACCEPTED. A failed mode batch rolls expected state back to this (a
+        # failed command must not blind the blueprint's expected-vs-actual
+        # safety net). Replaces the v2.40.0 single-slot snapshot, which a
+        # second mode command overwrote while the first was still in flight.
+        self._confirmed_expected: tuple[str | None, float | None] = (None, None)
+        # v2.45.0: One device.set() at a time per entity, newest value wins
+        # (see command_queue.py for the two problems this fixes).
+        self._commands = CommandQueue(
+            self._send_batch,
+            create_task=lambda coro: self.hass.async_create_task(
+                coro, name=f"daikin_set_{self.entity_id}"
+            ),
+            on_dispatch=self._on_batch_dispatch,
+            on_done=self._on_batch_done,
+        )
         # v2.40.0: Last coordinator-CONFIRMED active (non-off) HVAC mode.
         # Written only in _handle_coordinator_update, mirroring _last_known_pow.
         # Used by async_turn_on to restore the pre-off mode.
@@ -186,14 +199,10 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
     def _record_expected_state(self, hvac_mode: HVACMode | str) -> None:
         """Record expected HVAC mode for the blueprint's safety-net detection.
 
-        Snapshots the previous expected state first so a failed command can
-        roll back to the last truthful value instead of wiping it.
         Called BEFORE _set() so the record survives mode:restart cancellation.
+        If the command fails, _on_batch_done rolls back to the last
+        device-accepted record (_confirmed_expected).
         """
-        self._expected_state_snapshot = (
-            self._expected_hvac_mode,
-            self._expected_set_time,
-        )
         self._expected_hvac_mode = (
             hvac_mode.value if isinstance(hvac_mode, HVACMode) else str(hvac_mode)
         )
@@ -250,10 +259,25 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
 
             # Persistent expected state is recorded by the public handlers via
             # _record_expected_state() BEFORE this method runs (survives
-            # mode:restart cancellation). No duplicate write here: it would
-            # corrupt the rollback snapshot, and the old unconditional
-            # _expected_set_time refresh let fan/temp-only commands extend a
-            # stale expected_hvac_mode past its 1h expiry.
+            # mode:restart cancellation). No duplicate write here: the old
+            # unconditional _expected_set_time refresh let fan/temp-only
+            # commands extend a stale expected_hvac_mode past its 1h expiry.
+
+            # v2.37.0: Track ANY command for mode-transition pow bounce suppression
+            self._last_any_command_time = time.time()
+
+            # v2.45.0: Queue the command (merged into the pending batch, newest
+            # value per key wins). Done before the first await so commands
+            # reach the queue in call order. The worker sends one batch at a
+            # time on its own task, so a cancelled caller (blueprint
+            # mode:restart) or one whose 60 s wait expires never cancels the
+            # command itself (this replaces the v2.35.1 shield of a per-call
+            # task). _on_batch_done re-stamps the 45s grace on completion and
+            # handles failure rollback once per batch.
+            _LOGGER.debug(
+                "_set() queued values=%s, entity=%s", values, self.entity_id
+            )
+            waiter = self._commands.submit(values)
 
             # Trigger immediate UI update
             self.async_write_ha_state()
@@ -261,136 +285,31 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
             # This pushes the update to frontend BEFORE blocking device.set()
             await asyncio.sleep(0)
 
-            # v2.37.0: Track ANY command for mode-transition pow bounce suppression
-            self._last_any_command_time = time.time()
-
             try:
-                # v2.32.0: SIMPLIFIED - Never pass expected_pow to pydaikin
-                # Physical remote detection is handled ONLY via coordinator polling in
-                # _handle_coordinator_update().
-                # DO NOT update _last_known_pow here — coordinator only.
-                # The 45s any-command grace (_last_any_command_time) is the
-                # sole command protection window; the old 30s ON/OFF windows
-                # were unreachable under it and have been removed (v2.40.0).
-
-                # v2.35.0: Added detailed logging to trace command execution
-                _LOGGER.debug(
-                    "_set() calling device.set() with values=%s, entity=%s",
-                    values, self.entity_id
+                # v2.38.0: 60s cap on how long this caller waits. With the
+                # queue that covers the batch in flight plus this one.
+                result = await asyncio.wait_for(asyncio.shield(waiter), timeout=60.0)
+            except asyncio.CancelledError:
+                # The caller was cancelled; the queued command still runs.
+                _LOGGER.info(
+                    "_set() caller cancelled, command still queued or executing. "
+                    "entity=%s, values=%s",
+                    self.entity_id, values
                 )
-
-                # v2.35.1: Use asyncio.shield() to prevent command cancellation
-                # When blueprint uses mode:restart, a new trigger cancels the current run.
-                # Without shield(), the HTTP request to the AC gets cancelled mid-flight,
-                # leaving the AC in an inconsistent state. With shield(), the HTTP request
-                # completes even if the automation is cancelled, ensuring the command
-                # reaches the device.
-                # v2.38.0: Added 60s timeout to prevent hung device.set() from blocking
-                # the automation forever.
-                # v2.40.0: Explicit task + done-callback. device.set() can
-                # legitimately outlive the 45s grace (60s wait_for, BRP084
-                # clipping retries) — the device's own pow flip would then land
-                # OUTSIDE the grace and fire a false override against our own
-                # command. The callback re-stamps _last_any_command_time when
-                # the command ACTUALLY completes (success, error, or cancel),
-                # so the grace is measured from completion. It also retrieves
-                # the orphaned task's exception, silencing asyncio's
-                # 'exception was never retrieved'. The pre-call stamp stays —
-                # both are required (in-flight window + completion window).
-                # Note: hass.async_create_task makes the set task
-                # HA-shutdown-cancellable (the old anonymous shield task was
-                # untracked); the callback's cancelled() branch handles that.
-                set_task = self.hass.async_create_task(
-                    self.device.set(values),
-                    name=f"daikin_set_{self.entity_id}",
-                )
-
-                def _on_set_complete(task: asyncio.Task) -> None:
-                    self._last_any_command_time = time.time()
-                    if task.cancelled():
-                        _LOGGER.warning(
-                            "device.set() cancelled before completion. entity=%s values=%s",
-                            self.entity_id, values
-                        )
-                    elif (exc := task.exception()) is not None:
-                        _LOGGER.warning(
-                            "Shielded device.set() finished with error %r. entity=%s values=%s",
-                            exc, self.entity_id, values
-                        )
-
-                set_task.add_done_callback(_on_set_complete)
-
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.shield(set_task),
-                        timeout=60.0
-                    )
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(
-                        "_set() timed out after 60s (command may still complete "
-                        "in the background). entity=%s, values=%s",
-                        self.entity_id, values
-                    )
-                    raise
-                except asyncio.CancelledError:
-                    # shield() was cancelled but the inner task continues
-                    # Log it but don't clear optimistic state - command is still running
-                    _LOGGER.info(
-                        "_set() task cancelled but command still executing (shielded). "
-                        "entity=%s, values=%s",
-                        self.entity_id, values
-                    )
-                    # Re-raise so HA knows the task was cancelled
-                    raise
-
-                _LOGGER.debug(
-                    "_set() device.set() completed successfully, entity=%s, result=%s",
-                    self.entity_id, result
-                )
-
-                # v2.32.0: Removed expected_pow result checking - no longer used
-                # Physical remote detection happens via _handle_coordinator_update() only
-
-                # Don't clear optimistic state here - let _handle_coordinator_update() do it
-                # when real device state arrives. This keeps UI responsive without flickering.
+                raise
             except Exception as e:
-                # repr(e), not str(e): str(TimeoutError()) is '' which both
-                # hid the message and defeated the old substring check.
-                _LOGGER.warning(
-                    "_set() EXCEPTION: %r. entity=%s, values=%s",
-                    e, self.entity_id, values
-                )
-                # Routine timeouts -> WARNING; everything else -> ERROR.
-                # BRP084 wraps its 20s HTTP timeouts in DaikinException with
-                # 'timeout' in the message (contract pinned by pydaikin test).
-                if isinstance(e, TimeoutError) or (
-                    isinstance(e, DaikinException) and "timeout" in str(e).lower()
-                ):
-                    _LOGGER.warning("Network timeout communicating with device: %r", e)
-                else:
-                    _LOGGER.error("Error setting device values: %r", e, exc_info=True)
-
-                # Clear optimistic state on failure
-                self._optimistic_target_temp = None
-                self._optimistic_hvac_mode = None
-                self._optimistic_fan_mode = None
-                self._optimistic_swing_mode = None
-                self._optimistic_set_time = None
-                # v2.40.0: A failed MODE command rolls expected state back to
-                # the previous successful command's record (keeps the
-                # blueprint's expected-vs-actual safety net armed with
-                # truthful data). Failed fan/swing/temp-only commands never
-                # touched expected state, so nothing to do for them.
-                if (
-                    ATTR_HVAC_MODE in settings
-                    and self._expected_state_snapshot is not None
-                ):
-                    (
-                        self._expected_hvac_mode,
-                        self._expected_set_time,
-                    ) = self._expected_state_snapshot
-                    self._expected_state_snapshot = None
-                self.async_write_ha_state()
+                if not waiter.done():
+                    # This caller's 60 s wait expired. The batch keeps going
+                    # and its own outcome (_on_batch_done) decides
+                    # optimistic/expected state.
+                    _LOGGER.warning(
+                        "_set() gave up waiting after 60s (command still queued "
+                        "or in flight). entity=%s, values=%s",
+                        self.entity_id, values
+                    )
+                # Otherwise the batch failed (a device TimeoutError lands here
+                # too): _on_batch_done already logged it and rolled back
+                # optimistic/expected state, once for the whole batch.
                 if isinstance(e, HomeAssistantError):
                     raise
                 # v2.44.0: re-raise device/network faults as HomeAssistantError.
@@ -399,6 +318,102 @@ class DaikinClimate(DaikinEntity, ClimateEntity):
                 # to abort the blueprint run even where the step was marked
                 # optional. The original exception stays chained.
                 raise HomeAssistantError(f"Daikin command failed: {e!r}") from e
+
+            _LOGGER.debug(
+                "_set() device.set() completed successfully, entity=%s, result=%s",
+                self.entity_id, result
+            )
+            # Don't clear optimistic state here - let _handle_coordinator_update() do it
+            # when real device state arrives. This keeps UI responsive without flickering.
+
+    async def _send_batch(self, values: dict[str, Any]) -> Any:
+        """Send one merged batch to the device (called by the command queue)."""
+        # v2.32.0: Never pass expected_pow to pydaikin. Physical remote
+        # detection is handled ONLY via coordinator polling in
+        # _handle_coordinator_update(). DO NOT update _last_known_pow here.
+        _LOGGER.debug(
+            "Command queue calling device.set() with values=%s, entity=%s",
+            values, self.entity_id
+        )
+        return await self.device.set(values)
+
+    def _on_batch_dispatch(self, values: dict[str, Any]) -> tuple | None:
+        """Capture the expected-state record a mode batch is about to send.
+
+        No newer mode can be pending at this instant (the batch was just taken
+        from the queue), so the current record belongs to this batch.
+        """
+        if HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE] in values:
+            return (self._expected_hvac_mode, self._expected_set_time)
+        return None
+
+    def _on_batch_done(
+        self,
+        values: dict[str, Any],
+        expected_token: tuple | None,
+        exc: BaseException | None,
+    ) -> None:
+        """Book-keep one finished batch (success or failure), once per batch."""
+        # v2.40.0: Re-stamp the 45s grace from COMPLETION. device.set() can
+        # legitimately outlive the grace (slow BRP072C, BRP084 clipping
+        # retries); the unit's own pow flip would otherwise land outside it
+        # and fire a false override against our own command.
+        self._last_any_command_time = time.time()
+
+        if exc is None:
+            if expected_token is not None:
+                self._confirmed_expected = expected_token
+            return
+
+        # repr(e), not str(e): str(TimeoutError()) is ''.
+        # Routine timeouts -> WARNING; everything else -> ERROR.
+        # BRP084 wraps its 20s HTTP timeouts in DaikinException with
+        # 'timeout' in the message (contract pinned by pydaikin test).
+        if isinstance(exc, TimeoutError) or (
+            isinstance(exc, DaikinException) and "timeout" in str(exc).lower()
+        ):
+            _LOGGER.warning(
+                "Network timeout communicating with device: %r. entity=%s, values=%s",
+                exc, self.entity_id, values
+            )
+        else:
+            _LOGGER.error(
+                "Error setting device values: %r. entity=%s, values=%s",
+                exc, self.entity_id, values,
+                exc_info=exc,
+            )
+
+        # Clear the optimistic values this batch carried, except where a newer
+        # command is already queued for the same setting (that one owns the
+        # optimistic value now).
+        for daikin_key, attr_name in (
+            (HA_ATTR_TO_DAIKIN[ATTR_TARGET_TEMPERATURE], "_optimistic_target_temp"),
+            (HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE], "_optimistic_hvac_mode"),
+            (HA_ATTR_TO_DAIKIN[ATTR_FAN_MODE], "_optimistic_fan_mode"),
+            (HA_ATTR_TO_DAIKIN[ATTR_SWING_MODE], "_optimistic_swing_mode"),
+        ):
+            if daikin_key in values and not self._commands.pending_has(daikin_key):
+                setattr(self, attr_name, None)
+        if (
+            self._optimistic_target_temp is None
+            and self._optimistic_hvac_mode is None
+            and self._optimistic_fan_mode is None
+            and self._optimistic_swing_mode is None
+        ):
+            self._optimistic_set_time = None
+
+        # v2.40.0: A failed MODE batch rolls expected state back to the last
+        # device-accepted record (keeps the blueprint's expected-vs-actual
+        # safety net armed with truthful data). Skipped when a newer mode
+        # command is already queued: it recorded its own expected state.
+        if expected_token is not None and not self._commands.pending_has(
+            HA_ATTR_TO_DAIKIN[ATTR_HVAC_MODE]
+        ):
+            (
+                self._expected_hvac_mode,
+                self._expected_set_time,
+            ) = self._confirmed_expected
+        self.async_write_ha_state()
 
     @property
     def unique_id(self) -> str:
